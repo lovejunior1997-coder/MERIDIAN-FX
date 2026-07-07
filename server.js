@@ -100,15 +100,26 @@ async function metaTrade(body) {
 const METAAPI = {
   async summary() { const a = await metaGet("/account-information"); return { balance: Number(a.balance), account: MT_ACCOUNT, environment: `${a.broker || "Vantage"} ${a.platform || "mt5"}` }; },
   async price(pair) { const p = await metaGet(`/symbols/${metaSym(pair)}/current-price`); return { bid: Number(p.bid), ask: Number(p.ask) }; },
-  async order({ pair, side, lots, stopLoss, takeProfit }) {
+  async order({ pair, side, lots, entry, stopLoss, takeProfit, decimals }) {
     const volume = Math.max(0.01, Math.round((lots || 0.01) * 100) / 100); // MT trades in lots, min 0.01
+    // fetch the live price and rebuild stops around the ACTUAL fill, on the correct side,
+    // never closer than a minimum distance (fixes TRADE_RETCODE_INVALID_STOPS)
+    const q = await METAAPI.price(pair);
+    const px = side === "sell" ? q.bid : q.ask;
+    const d = Number.isFinite(decimals) ? decimals : (px >= 1000 ? 2 : px >= 100 ? 3 : 5);
+    const minFrac = Number(process.env.MIN_STOP_FRAC || 0.0012); // ~0.12% floor
+    const floor = px * minFrac;
+    const anchor = Number(entry) || px;
+    let sl, tp;
+    if (stopLoss) { const dist = Math.max(Math.abs(anchor - Number(stopLoss)), floor); sl = side === "sell" ? px + dist : px - dist; }
+    if (takeProfit) { const dist = Math.max(Math.abs(Number(takeProfit) - anchor), floor); tp = side === "sell" ? px - dist : px + dist; }
     const b = await metaTrade({
       actionType: side === "sell" ? "ORDER_TYPE_SELL" : "ORDER_TYPE_BUY",
       symbol: metaSym(pair), volume,
-      ...(stopLoss ? { stopLoss: Number(stopLoss) } : {}),
-      ...(takeProfit ? { takeProfit: Number(takeProfit) } : {}),
+      ...(sl ? { stopLoss: +sl.toFixed(d) } : {}),
+      ...(tp ? { takeProfit: +tp.toFixed(d) } : {}),
     });
-    return { id: b.orderId || b.positionId || "filled", volume };
+    return { id: b.orderId || b.positionId || "filled", volume, price: +px.toFixed(d) };
   },
   async close(pair) { const b = await metaTrade({ actionType: "POSITIONS_CLOSE_SYMBOL", symbol: metaSym(pair) }); return { closed: b.stringCode || "ok" }; },
 };
