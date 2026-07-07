@@ -206,12 +206,15 @@ Search latest news/sentiment for ${d.pair}. Respond with ONLY JSON, no fences:
       const r = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "content-type": "application/json", "x-api-key": KEY, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1024, messages: [{ role: "user", content: prompt }], ...(useTools ? { tools: [{ type: "web_search_20250305", name: "web_search" }] } : {}) }),
+        body: JSON.stringify({ model: process.env.CLAUDE_MODEL || "claude-sonnet-4-5", max_tokens: 1024, messages: [{ role: "user", content: prompt }], ...(useTools ? { tools: [{ type: "web_search_20250305", name: "web_search" }] } : {}) }),
       });
-      if (!r.ok) throw new Error(`Anthropic ${r.status}`);
+      if (!r.ok) { let msg = ""; try { msg = (await r.json())?.error?.message || ""; } catch (_) {} throw new Error(`Anthropic ${r.status}${msg ? " — " + msg : ""}`); }
       return r.json();
     };
-    let data; try { data = await call(true); } catch (_) { data = await call(false); }
+    let data;
+    try { data = await call(true); } catch (e1) {
+      try { data = await call(false); } catch (e2) { throw new Error(e2.message); } // retry without web search, surface real reason
+    }
     const text = (data.content || []).map(b => (b.type === "text" ? b.text : "")).join("\n");
     const m = text.replace(/```json|```/g, "").match(/\{[\s\S]*\}/);
     if (!m) throw new Error("no signal parsed");
