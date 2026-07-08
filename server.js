@@ -124,6 +124,15 @@ const METAAPI = {
     });
     return { id: b.orderId || b.positionId || "filled", volume, price: +px.toFixed(d) };
   },
+  async positions() {
+    const list = await metaGet("/positions");
+    return (Array.isArray(list) ? list : []).map(p => ({
+      id: String(p.id), symbol: p.symbol, dir: p.type === "POSITION_TYPE_SELL" ? "short" : "long",
+      volume: Number(p.volume), entry: Number(p.openPrice), current: Number(p.currentPrice),
+      sl: p.stopLoss != null ? Number(p.stopLoss) : null, tp: p.takeProfit != null ? Number(p.takeProfit) : null,
+      pnl: Number(p.profit ?? p.unrealizedProfit ?? 0),
+    }));
+  },
   async close(pair) { const b = await metaTrade({ actionType: "POSITIONS_CLOSE_SYMBOL", symbol: metaSym(pair) }); return { closed: b.stringCode || "ok" }; },
 };
 
@@ -203,6 +212,15 @@ app.post("/order", async (req, res) => {
 app.post("/close/:pair", async (req, res) => {
   try { res.json({ ok: true, ...(await venue(venueFor(req.params.pair)).close(req.params.pair)) }); }
   catch (e) { res.status(502).json({ ok: false, error: e.message }); }
+});
+
+// ---- live open positions from the broker (source of truth) ----
+app.get("/positions", async (_req, res) => {
+  try {
+    const v = venue(USE_MT ? "metaapi" : "oanda");
+    if (!v.positions) return res.json({ positions: [], note: "not supported for this venue" });
+    res.json({ positions: await v.positions() });
+  } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
 // ---- AI analysis (runs Claude server-side with YOUR key) ----
