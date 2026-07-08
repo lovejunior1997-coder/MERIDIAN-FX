@@ -465,8 +465,10 @@ async function runScan(q = {}) {
       const { bias, setups } = findSetups({ htf: daily.candles, ltf: ltf.candles, rr });
       for (const s of setups) {
         const key = `${pair}:${s.type}:${s.dir}:${ltf.candles.at(-1).t}`;
-        if (seen.has(key)) continue;                      // already alerted on this bar
-        seen.set(key, Date.now());
+        if (notify) {                                     // de-dupe ALERTS only
+          if (seen.has(key)) continue;                    // already alerted on this bar
+          seen.set(key, Date.now());
+        }
         found.push({ pair, tf, source: ltf.source, ...s });
       }
       if (!setups.length) errors.push({ pair, bias, note: "no setup" });
