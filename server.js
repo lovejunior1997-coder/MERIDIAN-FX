@@ -39,6 +39,10 @@
    DAILY_LOSS_LIMIT=500
    # --- AI analysis (server-side Claude key for the hosted app) ---
    ANTHROPIC_API_KEY=sk-ant-...
+   # --- free live candles (optional but recommended) ---
+   # get a free key at twelvedata.com -> covers forex, metals & crypto.
+   # crypto also falls back to Kraken's free public OHLC with no key.
+   TWELVE_DATA_KEY=
    ============================================================ */
 
 const express = require("express");
@@ -55,6 +59,7 @@ const MT_ACCOUNT = process.env.MT_ACCOUNT;
 const MT_REGION = process.env.MT_REGION || "new-york";
 const MT_SUFFIX = process.env.MT_SUFFIX || "";
 const MT_BASE = `https://mt-client-api-v1.${MT_REGION}.agiliumtrade.ai`;
+const MD_BASE = `https://mt-market-data-client-api-v1.${MT_REGION}.agiliumtrade.ai`;
 
 const O_ENV = process.env.OANDA_ENV || "practice";
 const O_BASE = O_ENV === "live" ? "https://api-fxtrade.oanda.com" : "https://api-fxpractice.oanda.com";
@@ -100,6 +105,17 @@ async function metaTrade(body) {
 const METAAPI = {
   async summary() { const a = await metaGet("/account-information"); return { balance: Number(a.balance), account: MT_ACCOUNT, environment: `${a.broker || "Vantage"} ${a.platform || "mt5"}` }; },
   async price(pair) { const p = await metaGet(`/symbols/${metaSym(pair)}/current-price`); return { bid: Number(p.bid), ask: Number(p.ask) }; },
+  async candles(pair, tf, limit = 200) {
+    const map = { "15M": "15m", "1H": "1h", "4H": "4h", "1D": "1d" };
+    const t = map[String(tf).toUpperCase()] || "1h";
+    const url = `${MD_BASE}/users/current/accounts/${MT_ACCOUNT}/historical-market-data/symbols/${metaSym(pair)}/timeframes/${t}/candles?limit=${Math.min(limit, 1000)}`;
+    const r = await fetch(url, { headers: mtH() });
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(b?.message || `MetaApi candles ${r.status}`);
+    const rows = Array.isArray(b) ? b : [];
+    return rows.map(c => ({ t: c.time, o: Number(c.open), h: Number(c.high), l: Number(c.low), c: Number(c.close) }))
+               .filter(c => Number.isFinite(c.o) && Number.isFinite(c.c));
+  },
   async order({ pair, side, lots, entry, stopLoss, takeProfit, decimals, rr }) {
     const volume = Math.max(0.01, Math.round((lots || 0.01) * 100) / 100); // MT trades in lots, min 0.01
     // fetch the live price and rebuild stops around the ACTUAL fill, on the correct side,
@@ -214,6 +230,56 @@ app.post("/close/:pair", async (req, res) => {
   catch (e) { res.status(502).json({ ok: false, error: e.message }); }
 });
 
+// -------- free candle sources (no MetaApi market-data plan needed) --------
+const TD_KEY = process.env.TWELVE_DATA_KEY;
+
+// Kraken public OHLC — free, no key, crypto only
+async function krakenCandles(pair, tf, limit = 200) {
+  const sym = KRAKEN_SYM[pair];
+  if (!sym) throw new Error(`${pair} not a Kraken symbol`);
+  const mins = { "15M": 15, "1H": 60, "4H": 240, "1D": 1440 }[String(tf).toUpperCase()] || 60;
+  const d = await krakenPublic("OHLC", `?pair=${sym}&interval=${mins}`);
+  const key = Object.keys(d).find(k => k !== "last");
+  const rows = (d[key] || []).slice(-limit);
+  return rows.map(r => ({ t: r[0] * 1000, o: +r[1], h: +r[2], l: +r[3], c: +r[4] }));
+}
+
+// Twelve Data — free tier key, covers forex, metals and crypto
+async function twelveCandles(pair, tf, limit = 200) {
+  if (!TD_KEY) throw new Error("TWELVE_DATA_KEY not set");
+  const iv = { "15M": "15min", "1H": "1h", "4H": "4h", "1D": "1day" }[String(tf).toUpperCase()] || "1h";
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(pair)}&interval=${iv}&outputsize=${Math.min(limit, 500)}&apikey=${TD_KEY}`;
+  const r = await fetch(url);
+  const b = await r.json().catch(() => ({}));
+  if (b.status === "error" || !Array.isArray(b.values)) throw new Error(b.message || "Twelve Data error");
+  return b.values.map(v => ({ t: Date.parse(v.datetime), o: +v.open, h: +v.high, l: +v.low, c: +v.close }))
+                 .filter(c => Number.isFinite(c.c)).reverse(); // API returns newest-first
+}
+
+// try each source in order until one yields usable candles
+async function getCandles(pair, tf, limit) {
+  const isCrypto = Boolean(KRAKEN_SYM[pair]);
+  const chain = [];
+  if (USE_MT && METAAPI.candles) chain.push(["metaapi", () => METAAPI.candles(pair, tf, limit)]);
+  if (isCrypto) chain.push(["kraken", () => krakenCandles(pair, tf, limit)]);
+  if (TD_KEY) chain.push(["twelvedata", () => twelveCandles(pair, tf, limit)]);
+  const errors = [];
+  for (const [name, fn] of chain) {
+    try { const rows = await fn(); if (rows && rows.length >= 30) return { source: name, candles: rows }; errors.push(`${name}: too few candles`); }
+    catch (e) { errors.push(`${name}: ${e.message}`); }
+  }
+  throw new Error(errors.join(" | ") || "no candle source configured");
+}
+
+// ---- real historical candles (drives the chart AND the indicators) ----
+app.get("/candles/:pair", async (req, res) => {
+  try {
+    const tf = req.query.tf || "1H";
+    const { source, candles } = await getCandles(req.params.pair, tf, Number(req.query.limit) || 200);
+    res.json({ pair: req.params.pair, tf, source, candles });
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
 // ---- live open positions from the broker (source of truth) ----
 app.get("/positions", async (_req, res) => {
   try {
@@ -230,7 +296,8 @@ app.post("/analyze", async (req, res) => {
   try {
     const d = req.body || {};
     const trend = d.sma20 > d.sma50 ? "SMA20 above SMA50 (bullish)" : "SMA20 below SMA50 (bearish)";
-    const prompt = `You are a disciplined FX analyst. Analyze ${d.pair} on ${d.tf} using ONLY this data plus current news you find. Do not invent levels.
+    const src = d.dataLive ? "These are REAL live broker prices." : "WARNING: these are SIMULATED prices, not real market data — say so in your rationale and keep confidence low.";
+    const prompt = `You are a disciplined FX analyst. Analyze ${d.pair} on ${d.tf} using ONLY this data plus current news you find. Do not invent levels. ${src}
 DATA: price ${d.price}, change ${Number(d.changePct).toFixed(2)}%, SMA20 ${d.sma20}, SMA50 ${d.sma50} (${trend}), RSI14 ${Number(d.rsi).toFixed(1)}, ATR14 ${d.atr}, 30-bar range ${d.lo30}-${d.hi30}, pip ${d.pip}.
 Search latest news/sentiment for ${d.pair}. Respond with ONLY JSON, no fences:
 {"bias":"long|short|neutral","confidence":<0-100 int>,"entry":<num>,"stopLoss":<num>,"takeProfit":<num>,"rationale":"<=2 sentences","risks":["short","short"],"catalysts":["short","..."]}`;
