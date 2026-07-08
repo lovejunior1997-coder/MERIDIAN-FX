@@ -66,6 +66,7 @@ const cors = require("cors");
 const crypto = require("crypto");
 const { findSetups, structure, chartBrief } = require("./strategy");
 const auto = require("./autotrader");
+const bt = require("./backtest");
 
 const app = express();
 app.use(express.json());
@@ -526,6 +527,35 @@ app.get("/auto/resume", (_req, res) => res.json(auto.resume()));
 app.all("/auto/run", async (req, res) => {
   try { res.json(await auto.runAuto(autoDeps, { tf: req.query.tf || "1H", rr: req.query.rr || 3 })); }
   catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+
+/* ============================================================
+   BACKTEST — walk YOUR rules over history. No lookahead.
+   GET /backtest/EUR%2FUSD?tf=1H&rr=3&bars=1000&maxBars=80&trades=1
+   ============================================================ */
+app.get("/backtest/:pair", async (req, res) => {
+  try {
+    const pair = req.params.pair;
+    const tf = String(req.query.tf || "1H").toUpperCase();
+    const rr = Number(req.query.rr) || 3;
+    const bars = Math.min(Number(req.query.bars) || 1000, 1000);
+    const maxBars = Number(req.query.maxBars) || 80;
+    const spreadPips = Number(req.query.spreadPips) || 0;
+    const pip = pair.includes("JPY") ? 0.01 : pair.startsWith("X") ? 0.1 : 0.0001;
+
+    const ltf = await getCandles(pair, tf, bars);
+    await new Promise(r => setTimeout(r, 200));
+    const daily = await getCandles(pair, "1D", 400);
+    if (ltf.candles.length < 120) throw new Error(`only ${ltf.candles.length} candles returned — need more history`);
+
+    const out = bt.run({ htf: daily.candles, ltf: ltf.candles, rr, warmup: 60,
+                         cooldownBars: 5, spread: spreadPips * pip, maxBars });
+    const wantTrades = String(req.query.trades || "0") === "1";
+    res.json({ pair, tf, source: ltf.source, params: out.params, overall: out.overall,
+               byType: out.byType, byDirection: out.byDirection, openAtEnd: out.openAtEnd,
+               trades: wantTrades ? out.trades : undefined });
+  } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
 const PORT = process.env.PORT || 8080;
