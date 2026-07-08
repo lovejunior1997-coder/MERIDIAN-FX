@@ -416,6 +416,83 @@ Reply with ONLY JSON, no fences:
 });
 
 /* ============================================================
+   SETUP SCANNER — scans YOUR rules across a watchlist.
+   HTF bias (1D) -> LTF entry (1H or 15M).
+   A) trendline 3-touch   B) BOS + supply/demand retest
+   Alerts to Telegram so you never sit on charts.
+   ============================================================ */
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TG_CHAT  = process.env.TELEGRAM_CHAT_ID;
+const WATCH = (process.env.WATCHLIST ||
+  "EUR/USD,GBP/USD,USD/JPY,AUD/USD,USD/CAD,USD/CHF,NZD/USD,EUR/JPY,GBP/JPY,XAU/USD"
+).split(",").map(x => x.trim()).filter(Boolean);
+
+async function telegram(text) {
+  if (!TG_TOKEN || !TG_CHAT) return { skipped: "telegram not configured" };
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: TG_CHAT, text, parse_mode: "Markdown" }),
+    });
+    return r.ok ? { sent: true } : { error: `telegram ${r.status}` };
+  } catch (e) { return { error: e.message }; }
+}
+
+const seen = new Map();                         // de-dupe: one alert per setup per bar
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+function fmtSetup(pair, s, tf) {
+  const d = pair.includes("JPY") ? 3 : pair.startsWith("X") ? 2 : 5;
+  const arrow = s.dir === "buy" ? "BUY" : "SELL";
+  return `${arrow} *${pair}*  _${s.type}_ (${tf})\n`
+       + `entry \`${s.entry.toFixed(d)}\`  SL \`${s.sl.toFixed(d)}\`  TP \`${s.tp.toFixed(d)}\`\n`
+       + `R:R 1:${s.rr}  ·  stop ${s.stopPct}%  ·  HTF ${s.htfBias}\n`
+       + `${s.note}`;
+}
+
+async function runScan(q = {}) {
+  const tf = String(q.tf || "1H").toUpperCase();
+  const rr = Number(q.rr) || 3;
+  const notify = String(q.notify ?? "1") !== "0";
+  const pairs = q.pairs ? String(q.pairs).split(",").map(x => x.trim()) : WATCH;
+
+  const found = [], errors = [];
+  for (const pair of pairs) {
+    try {
+      const daily = await getCandles(pair, "1D", 120);
+      await sleep(150);                                   // stay under data-source rate limits
+      const ltf = await getCandles(pair, tf, 200);
+      const { bias, setups } = findSetups({ htf: daily.candles, ltf: ltf.candles, rr });
+      for (const s of setups) {
+        const key = `${pair}:${s.type}:${s.dir}:${ltf.candles.at(-1).t}`;
+        if (seen.has(key)) continue;                      // already alerted on this bar
+        seen.set(key, Date.now());
+        found.push({ pair, tf, source: ltf.source, ...s });
+      }
+      if (!setups.length) errors.push({ pair, bias, note: "no setup" });
+      await sleep(150);
+    } catch (e) { errors.push({ pair, error: e.message }); }
+  }
+
+  const cut = Date.now() - 864e5;                          // prune de-dupe cache (24h)
+  for (const [k, v] of seen) if (v < cut) seen.delete(k);
+
+  let tg = null;
+  if (found.length && notify) {
+    const body = found.map(s => fmtSetup(s.pair, s, s.tf)).join("\n\n");
+    tg = await telegram(`*MERIDIAN — ${found.length} setup${found.length > 1 ? "s" : ""}*\n\n${body}`);
+  }
+  return { scanned: pairs.length, found, telegram: tg, skipped: errors };
+}
+
+app.get("/scan", async (req, res) => {
+  try { res.json(await runScan(req.query)); } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+// quick check that alerts reach your phone
+app.get("/scan/test-alert", async (_req, res) => res.json(await telegram("Meridian alerts are working.")));
+
+/* ============================================================
    AUTONOMOUS TRADING — off unless AUTO_TRADE=true.
    Claude can only VETO. Guardrails decide. Kill switch always wins.
    ============================================================ */
