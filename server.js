@@ -43,11 +43,29 @@
    # get a free key at twelvedata.com -> covers forex, metals & crypto.
    # crypto also falls back to Kraken's free public OHLC with no key.
    TWELVE_DATA_KEY=
+   # --- setup scanner + phone alerts ---
+   TELEGRAM_BOT_TOKEN=      # from @BotFather
+   TELEGRAM_CHAT_ID=        # from @userinfobot
+   WATCHLIST=EUR/USD,GBP/USD,USD/JPY,XAU/USD
+   # --- AUTONOMOUS TRADING (all optional; off by default) ---
+   AUTO_TRADE=false            # master switch. Nothing trades until this is true.
+   AUTO_ALLOW_LIVE=false       # refuses to trade a non-demo account unless true
+   AUTO_RISK_PCT=0.5           # risk per trade, % of equity
+   AUTO_MAX_TRADES_DAY=3
+   AUTO_MAX_OPEN=2
+   AUTO_DAILY_LOSS_PCT=3       # trips the kill switch, stays tripped
+   AUTO_MIN_RR=2
+   AUTO_MAX_SPREAD_PIPS=3
+   AUTO_COOLDOWN_MIN=120       # per pair
+   AUTO_SESSIONS=07:00-20:00   # UTC, comma-separated windows
+   AUTO_CLAUDE_VETO=true       # Claude blocks trades near high-impact news
    ============================================================ */
 
 const express = require("express");
 const cors = require("cors");
 const crypto = require("crypto");
+const { findSetups, structure, chartBrief } = require("./strategy");
+const auto = require("./autotrader");
 
 const app = express();
 app.use(express.json());
@@ -289,36 +307,146 @@ app.get("/positions", async (_req, res) => {
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
-// ---- AI analysis (runs Claude server-side with YOUR key) ----
+// ---- AI analysis, read through YOUR framework ----
+// Daily structure -> bias. Then trendline touches + BOS/zones on the entry timeframe.
+// Claude interprets THOSE facts. It never invents levels.
 app.post("/analyze", async (req, res) => {
   const KEY = process.env.ANTHROPIC_API_KEY;
   if (!KEY) return res.status(400).json({ error: "ANTHROPIC_API_KEY not set on server" });
+  const d = req.body || {};
+  const pair = d.pair, tf = (d.tf || "1H").toUpperCase();
+  const dec = Number.isFinite(d.decimals) ? d.decimals : 5;
+
   try {
-    const d = req.body || {};
-    const trend = d.sma20 > d.sma50 ? "SMA20 above SMA50 (bullish)" : "SMA20 below SMA50 (bearish)";
-    const src = d.dataLive ? "These are REAL live broker prices." : "WARNING: these are SIMULATED prices, not real market data — say so in your rationale and keep confidence low.";
-    const prompt = `You are a disciplined FX analyst. Analyze ${d.pair} on ${d.tf} using ONLY this data plus current news you find. Do not invent levels. ${src}
-DATA: price ${d.price}, change ${Number(d.changePct).toFixed(2)}%, SMA20 ${d.sma20}, SMA50 ${d.sma50} (${trend}), RSI14 ${Number(d.rsi).toFixed(1)}, ATR14 ${d.atr}, 30-bar range ${d.lo30}-${d.hi30}, pip ${d.pip}.
-Search latest news/sentiment for ${d.pair}. Respond with ONLY JSON, no fences:
-{"bias":"long|short|neutral","confidence":<0-100 int>,"entry":<num>,"stopLoss":<num>,"takeProfit":<num>,"rationale":"<=2 sentences","risks":["short","short"],"catalysts":["short","..."]}`;
+    // pull real candles: daily for bias, entry timeframe for the setup
+    const daily = await getCandles(pair, "1D", 120);
+    const ltf = await getCandles(pair, tf, 200);
+    const b = chartBrief(daily.candles, ltf.candles);
+
+    const tl = b.trendline
+      ? `${b.trendline.touches} touch(es) on the ${b.trendline.direction} trendline; line currently at ${b.trendline.linePrice}; price is ${b.trendline.distanceATR} ATR away; ${b.trendline.ready ? "THIRD TOUCH IS IN PLACE" : "third touch NOT yet formed"}.`
+      : "no valid trendline in the direction of the daily trend.";
+    const smc = b.smc
+      ? (b.smc.bos
+          ? `Break of structure confirmed through ${b.smc.brokeLevel}. Origin ${b.smc.kind} zone ${b.smc.zone ? b.smc.zone.lo + "-" + b.smc.zone.hi : "not identified"}. Price ${b.smc.inZone ? "IS INSIDE the zone now" : `is ${b.smc.distanceATR} ATR away from it`}.`
+          : `No break of structure yet. Watch ${b.smc.watchLevel}.`)
+      : "no SMC read available.";
+
+    const prompt = `You are analysing a chart for a trader with 8 years' experience who trades ONE way. Use HIS framework only. Do not mention RSI, MACD or generic indicators.
+
+HIS RULES:
+- Directional bias comes from the DAILY structure. He only ever trades WITH that trend.
+- Trendline setup: he needs THREE touches. He enters on the 3rd lower high (sell) or 3rd higher low (buy). Stop goes just beyond that swing.
+- SMC setup: after a break of structure, he waits for price to return into the origin supply zone (sell) or demand zone (buy), entering on a lower timeframe.
+- No setup = no trade. Patience is part of the edge.
+
+CHART FACTS (computed from real ${ltf.source} candles — these are the only levels you may use):
+- Pair ${pair}, entry timeframe ${tf}, current price ${b.price}, ATR ${b.atr}
+- DAILY structure: ${b.htfBias}. Recent daily swing highs ${JSON.stringify(b.htfSwingHighs)}, lows ${JSON.stringify(b.htfSwingLows)}
+- ${tf} structure: ${b.ltfBias}. Swing highs ${JSON.stringify(b.ltfSwingHighs)}, lows ${JSON.stringify(b.ltfSwingLows)}
+- TRENDLINE: ${tl}
+- SMC: ${smc}
+
+Search for current news/sentiment on ${pair} that could matter.
+
+Then answer as his analyst. If no setup is valid yet, say so plainly and describe exactly what must happen first — that is a useful answer, not a failure.
+
+Reply with ONLY JSON, no fences:
+{"bias":"long|short|neutral",
+ "setupValid": true|false,
+ "setupType":"trendline|smc|none",
+ "confidence":<0-100 int>,
+ "entry":<number>,
+ "stopLoss":<number, placed beyond the relevant swing/zone per his rules>,
+ "structureRead":"<1-2 sentences on daily + entry timeframe structure>",
+ "setupRead":"<1-2 sentences on the trendline touches and/or BOS+zone>",
+ "waitFor":"<what must happen before he can enter; empty string if setupValid>",
+ "risks":["short","short"],
+ "catalysts":["short","..."]}`;
+
     const call = async (useTools) => {
       const r = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "content-type": "application/json", "x-api-key": KEY, "anthropic-version": "2023-06-01" },
-        body: JSON.stringify({ model: process.env.CLAUDE_MODEL || "claude-sonnet-4-5", max_tokens: 1024, messages: [{ role: "user", content: prompt }], ...(useTools ? { tools: [{ type: "web_search_20250305", name: "web_search" }] } : {}) }),
+        body: JSON.stringify({ model: process.env.CLAUDE_MODEL || "claude-sonnet-4-5", max_tokens: 1200,
+          messages: [{ role: "user", content: prompt }],
+          ...(useTools ? { tools: [{ type: "web_search_20250305", name: "web_search" }] } : {}) }),
       });
-      if (!r.ok) { let msg = ""; try { msg = (await r.json())?.error?.message || ""; } catch (_) {} throw new Error(`Anthropic ${r.status}${msg ? " — " + msg : ""}`); }
+      if (!r.ok) { let m = ""; try { m = (await r.json())?.error?.message || ""; } catch (_) {} throw new Error(`Anthropic ${r.status}${m ? " — " + m : ""}`); }
       return r.json();
     };
-    let data;
-    try { data = await call(true); } catch (e1) {
-      try { data = await call(false); } catch (e2) { throw new Error(e2.message); } // retry without web search, surface real reason
-    }
-    const text = (data.content || []).map(b => (b.type === "text" ? b.text : "")).join("\n");
+    let data; try { data = await call(true); } catch (e1) { data = await call(false); }
+    const text = (data.content || []).map(x => (x.type === "text" ? x.text : "")).join("\n");
     const m = text.replace(/```json|```/g, "").match(/\{[\s\S]*\}/);
-    if (!m) throw new Error("no signal parsed");
-    res.json(JSON.parse(m[0]));
+    if (!m) throw new Error("no analysis parsed");
+    const j = JSON.parse(m[0]);
+
+    /* ---- YOUR RULES ARE AUTHORITATIVE ----
+       Claude writes the commentary. It does NOT get to choose the levels.
+       Entry and stop come from strategy.js, or there is no trade.        */
+    const det = findSetups({ htf: daily.candles, ltf: ltf.candles, rr: Number(d.rr) || 3 });
+    const out = {
+      confidence: Math.max(0, Math.min(100, Math.round(j.confidence || 0))),
+      structureRead: j.structureRead || "", setupRead: j.setupRead || "",
+      risks: Array.isArray(j.risks) ? j.risks.slice(0, 3) : [],
+      catalysts: Array.isArray(j.catalysts) ? j.catalysts.slice(0, 4) : [],
+    };
+
+    if (det.setups.length) {
+      const pick = det.setups.find(x => x.type === j.setupType) || det.setups[0];
+      Object.assign(out, {
+        setupValid: true, setupType: pick.type,
+        bias: pick.dir === "sell" ? "short" : "long",
+        entry: pick.entry, stopLoss: pick.sl,      // stop sits beyond the swing / zone
+        setupNote: pick.note, levelsFrom: "strategy.js — your rules", waitFor: "",
+      });
+    } else {
+      Object.assign(out, {
+        setupValid: false, setupType: "none",
+        bias: b.htfBias === "bullish" ? "long" : b.htfBias === "bearish" ? "short" : "neutral",
+        entry: b.price, stopLoss: null,
+        setupNote: "", levelsFrom: "none — no valid setup",
+        waitFor: j.waitFor || "No valid setup. Wait for a third trendline touch, or a break of structure followed by a return into the zone.",
+      });
+      out.confidence = Math.min(out.confidence, 25);   // no setup => low confidence, always
+    }
+
+    res.json({ ...out, brief: b, source: ltf.source, decimals: dec });
   } catch (e) { res.status(502).json({ error: e.message }); }
+});
+
+/* ============================================================
+   AUTONOMOUS TRADING — off unless AUTO_TRADE=true.
+   Claude can only VETO. Guardrails decide. Kill switch always wins.
+   ============================================================ */
+async function accountSnapshot() {
+  if (!USE_MT) throw new Error("auto-trading requires a MetaApi/MT broker");
+  const a = await metaGet("/account-information");
+  const server = String(a.server || "");
+  const isDemo = /demo|practice/i.test(server) || /demo/i.test(String(a.type || ""));
+  return { balance: Number(a.balance), equity: Number(a.equity ?? a.balance), server, isDemo };
+}
+
+const autoDeps = {
+  scan: (opts) => runScan({ ...opts, notify: "0" }),      // scanner alerts are separate
+  account: accountSnapshot,
+  positions: () => METAAPI.positions(),
+  price: (pair) => METAAPI.price(pair),
+  order: (o) => METAAPI.order(o),
+  notify: telegram,
+};
+
+app.get("/auto/status", (_req, res) => res.json(auto.status()));
+app.post("/auto/stop",  (req, res) => { const s = auto.stop(req.query.reason || "manual stop"); telegram("🛑 Auto-trading STOPPED."); res.json(s); });
+app.post("/auto/resume",(_req, res) => { const s = auto.resume(); telegram("▶️ Auto-trading resumed."); res.json(s); });
+// GET aliases so you can hit them from a phone browser in a hurry
+app.get("/auto/stop",   (req, res) => { const s = auto.stop(req.query.reason || "manual stop"); telegram("🛑 Auto-trading STOPPED."); res.json(s); });
+app.get("/auto/resume", (_req, res) => res.json(auto.resume()));
+
+// the cron target: one autonomous pass
+app.all("/auto/run", async (req, res) => {
+  try { res.json(await auto.runAuto(autoDeps, { tf: req.query.tf || "1H", rr: req.query.rr || 3 })); }
+  catch (e) { res.status(502).json({ error: e.message }); }
 });
 
 const PORT = process.env.PORT || 8080;
