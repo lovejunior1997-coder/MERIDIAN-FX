@@ -333,7 +333,9 @@ app.post("/analyze", async (req, res) => {
           : `No break of structure yet. Watch ${b.smc.watchLevel}.`)
       : "no SMC read available.";
 
-    const prompt = `You are analysing a chart for a trader with 8 years' experience who trades ONE way. Use HIS framework only. Do not mention RSI, MACD or generic indicators.
+    const mode = String(d.mode || "rules").toLowerCase();   // "rules" | "claude"
+
+    const rulesPrompt = `You are analysing a chart for a trader with 8 years' experience who trades ONE way. Use HIS framework only. Do not mention RSI, MACD or generic indicators.
 
 HIS RULES:
 - Directional bias comes from the DAILY structure. He only ever trades WITH that trend.
@@ -349,21 +351,29 @@ CHART FACTS (computed from real ${ltf.source} candles — these are the only lev
 - SMC: ${smc}
 
 Search for current news/sentiment on ${pair} that could matter.
-
-Then answer as his analyst. If no setup is valid yet, say so plainly and describe exactly what must happen first — that is a useful answer, not a failure.
+Then answer as his analyst. If no setup is valid yet, say so plainly and describe what must happen first.
 
 Reply with ONLY JSON, no fences:
-{"bias":"long|short|neutral",
- "setupValid": true|false,
- "setupType":"trendline|smc|none",
- "confidence":<0-100 int>,
- "entry":<number>,
- "stopLoss":<number, placed beyond the relevant swing/zone per his rules>,
- "structureRead":"<1-2 sentences on daily + entry timeframe structure>",
- "setupRead":"<1-2 sentences on the trendline touches and/or BOS+zone>",
- "waitFor":"<what must happen before he can enter; empty string if setupValid>",
- "risks":["short","short"],
- "catalysts":["short","..."]}`;
+{"bias":"long|short|neutral","setupValid":true|false,"setupType":"trendline|smc|none","confidence":<0-100 int>,"entry":<number>,"stopLoss":<number>,"structureRead":"<1-2 sentences>","setupRead":"<1-2 sentences>","waitFor":"<what to wait for; empty if valid>","risks":["short","short"],"catalysts":["short","..."]}`;
+
+    const claudePrompt = `You are an independent technical analyst. Form YOUR OWN view of ${pair} on ${tf}. You may use any method — structure, momentum, support/resistance, trend, patterns — and current news. Only use the real price levels given below; do not invent numbers outside this range.
+
+REAL DATA (${ltf.source} candles):
+- Pair ${pair}, entry timeframe ${tf}, current price ${b.price}, ATR ${b.atr}
+- DAILY structure: ${b.htfBias}. Recent daily swing highs ${JSON.stringify(b.htfSwingHighs)}, lows ${JSON.stringify(b.htfSwingLows)}
+- ${tf} structure: ${b.ltfBias}. Swing highs ${JSON.stringify(b.ltfSwingHighs)}, lows ${JSON.stringify(b.ltfSwingLows)}
+
+Search for current news/sentiment on ${pair}.
+
+Rules for your levels:
+- If you see a trade, set entry near ${b.price}, put stopLoss beyond a real nearby swing from the lists above, sized sensibly vs ATR ${b.atr}.
+- If nothing is compelling, set tradeable=false and say why. "No trade" is a valid, honest answer.
+- Be conservative with confidence. You have NO verified track record; never imply certainty.
+
+Reply with ONLY JSON, no fences:
+{"bias":"long|short|neutral","tradeable":true|false,"confidence":<0-100 int>,"entry":<number>,"stopLoss":<number>,"method":"<approach used>","structureRead":"<1-2 sentences>","setupRead":"<why enter here / why not>","risks":["short","short"],"catalysts":["short","..."]}`;
+
+    const prompt = mode === "claude" ? claudePrompt : rulesPrompt;
 
     const call = async (useTools) => {
       const r = await fetch("https://api.anthropic.com/v1/messages", {
@@ -382,34 +392,58 @@ Reply with ONLY JSON, no fences:
     if (!m) throw new Error("no analysis parsed");
     const j = JSON.parse(m[0]);
 
-    /* ---- YOUR RULES ARE AUTHORITATIVE ----
-       Claude writes the commentary. It does NOT get to choose the levels.
-       Entry and stop come from strategy.js, or there is no trade.        */
-    const det = findSetups({ htf: daily.candles, ltf: ltf.candles, rr: Number(d.rr) || 3 });
     const out = {
+      mode,
       confidence: Math.max(0, Math.min(100, Math.round(j.confidence || 0))),
       structureRead: j.structureRead || "", setupRead: j.setupRead || "",
       risks: Array.isArray(j.risks) ? j.risks.slice(0, 3) : [],
       catalysts: Array.isArray(j.catalysts) ? j.catalysts.slice(0, 4) : [],
     };
 
-    if (det.setups.length) {
-      const pick = det.setups.find(x => x.type === j.setupType) || det.setups[0];
+    if (mode === "claude") {
+      /* ---- CLAUDE'S OWN VIEW ----
+         Claude proposes bias, entry and stop. We validate the stop is on the
+         correct side and not absurdly tight; we do NOT invent levels for it.  */
+      const bias = (j.bias || "neutral").toLowerCase();
+      const isShort = bias === "short" || bias === "sell";
+      let entry = Number(j.entry), sl = Number(j.stopLoss);
+      const a = b.atr || b.price * 0.001;
+      const tradeable = Boolean(j.tradeable) && bias !== "neutral" && Number.isFinite(entry) && Number.isFinite(sl);
+      const sideOK = tradeable && (isShort ? sl > entry : sl < entry);
+      const farEnough = tradeable && Math.abs(entry - sl) >= a * 0.3;   // reject ultra-tight AI stops
+      const valid = tradeable && sideOK && farEnough;
       Object.assign(out, {
-        setupValid: true, setupType: pick.type,
-        bias: pick.dir === "sell" ? "short" : "long",
-        entry: pick.entry, stopLoss: pick.sl,      // stop sits beyond the swing / zone
-        setupNote: pick.note, levelsFrom: "strategy.js — your rules", waitFor: "",
+        setupValid: valid, setupType: valid ? "claude" : "none",
+        bias: isShort ? "short" : bias === "long" || bias === "buy" ? "long" : "neutral",
+        entry: valid ? entry : b.price,
+        stopLoss: valid ? sl : null,
+        method: j.method || "",
+        setupNote: valid ? (j.method || "Claude analysis") : "",
+        levelsFrom: valid ? "claude — independent analysis" : "none — Claude sees no trade",
+        waitFor: valid ? "" : (j.setupRead || "Claude does not see a compelling trade right now."),
       });
+      if (!valid) out.confidence = Math.min(out.confidence, 30);
     } else {
-      Object.assign(out, {
-        setupValid: false, setupType: "none",
-        bias: b.htfBias === "bullish" ? "long" : b.htfBias === "bearish" ? "short" : "neutral",
-        entry: b.price, stopLoss: null,
-        setupNote: "", levelsFrom: "none — no valid setup",
-        waitFor: j.waitFor || "No valid setup. Wait for a third trendline touch, or a break of structure followed by a return into the zone.",
-      });
-      out.confidence = Math.min(out.confidence, 25);   // no setup => low confidence, always
+      /* ---- YOUR RULES ARE AUTHORITATIVE ---- */
+      const det = findSetups({ htf: daily.candles, ltf: ltf.candles, rr: Number(d.rr) || 3 });
+      if (det.setups.length) {
+        const pick = det.setups.find(x => x.type === j.setupType) || det.setups[0];
+        Object.assign(out, {
+          setupValid: true, setupType: pick.type,
+          bias: pick.dir === "sell" ? "short" : "long",
+          entry: pick.entry, stopLoss: pick.sl,
+          setupNote: pick.note, levelsFrom: "strategy.js — your rules", waitFor: "",
+        });
+      } else {
+        Object.assign(out, {
+          setupValid: false, setupType: "none",
+          bias: b.htfBias === "bullish" ? "long" : b.htfBias === "bearish" ? "short" : "neutral",
+          entry: b.price, stopLoss: null,
+          setupNote: "", levelsFrom: "none — no valid setup",
+          waitFor: j.waitFor || "No valid setup. Wait for a third trendline touch, or a break of structure with a return into the zone.",
+        });
+        out.confidence = Math.min(out.confidence, 25);
+      }
     }
 
     res.json({ ...out, brief: b, source: ltf.source, decimals: dec });
@@ -463,7 +497,8 @@ async function runScan(q = {}) {
       const daily = await getCandles(pair, "1D", 120);
       await sleep(150);                                   // stay under data-source rate limits
       const ltf = await getCandles(pair, tf, 200);
-      const { bias, setups } = findSetups({ htf: daily.candles, ltf: ltf.candles, rr });
+      const strategies = q.strat ? String(q.strat).split(",") : ["trendline", "smc"];
+      const { bias, setups } = findSetups({ htf: daily.candles, ltf: ltf.candles, rr, strategies, tf });
       for (const s of setups) {
         const key = `${pair}:${s.type}:${s.dir}:${ltf.candles.at(-1).t}`;
         if (notify) {                                     // de-dupe ALERTS only
@@ -508,7 +543,7 @@ async function accountSnapshot() {
 }
 
 const autoDeps = {
-  scan: (opts) => runScan({ ...opts, notify: "0" }),      // scanner alerts are separate
+  scan: (opts) => runScan({ ...opts, notify: "0", strat: process.env.AUTO_STRATEGIES || "trendline,smc" }),      // scanner alerts are separate
   account: accountSnapshot,
   positions: () => METAAPI.positions(),
   price: (pair) => METAAPI.price(pair),
@@ -541,6 +576,7 @@ app.get("/backtest/:pair", async (req, res) => {
     const rr = Number(req.query.rr) || 3;
     const bars = Math.min(Number(req.query.bars) || 1000, 1000);
     const maxBars = Number(req.query.maxBars) || 80;
+    const strategies = req.query.strat ? String(req.query.strat).split(",") : ["trendline", "smc"];
     const spreadPips = Number(req.query.spreadPips) || 0;
     const pip = pair.includes("JPY") ? 0.01 : pair.startsWith("X") ? 0.1 : 0.0001;
 
@@ -550,7 +586,7 @@ app.get("/backtest/:pair", async (req, res) => {
     if (ltf.candles.length < 120) throw new Error(`only ${ltf.candles.length} candles returned — need more history`);
 
     const out = bt.run({ htf: daily.candles, ltf: ltf.candles, rr, warmup: 60,
-                         cooldownBars: 5, spread: spreadPips * pip, maxBars });
+                         cooldownBars: 5, spread: spreadPips * pip, maxBars, strategies, tf });
     const wantTrades = String(req.query.trades || "0") === "1";
     res.json({ pair, tf, source: ltf.source, params: out.params, overall: out.overall,
                byType: out.byType, byDirection: out.byDirection, openAtEnd: out.openAtEnd,
