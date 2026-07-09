@@ -136,23 +136,95 @@ function bosZoneSetup(c, bias, opts = {}) {
   return null;
 }
 
-// ---------- combine: HTF bias -> LTF entry ----------
-function findSetups({ htf, ltf, rr = 3, minRR = 2 }) {
-  const { bias } = structure(htf);                        // daily/4H directional bias
-  if (bias === "neutral") return { bias, setups: [] };
+/* ------------------------------------------------------------
+   ORB — Opening Range Breakout, real session opens only.
+   Tokyo 00:00, London 08:00, New York 13:00 (UTC, approx).
+   Marks the range over the first `rangeMins`, then enters on a
+   CLOSE beyond it (close-confirmation filters most fakeouts).
+   One attempt per session per day. Trend-agnostic by design.
+------------------------------------------------------------ */
+const SESSIONS = { Tokyo: { openUTC: 0 }, London: { openUTC: 8 }, NewYork: { openUTC: 13 } };
+function tfMinutes(tf) { return { "15M": 15, "1H": 60, "4H": 240, "1D": 1440 }[String(tf).toUpperCase()] || 60; }
 
+function orbSetup(candles, tf, opts = {}) {
+  const { rangeMins = 30, sessions = ["London", "NewYork", "Tokyo"], minRangeAtr = 0.4, maxChaseAtr = 1.0 } = opts;
+  const a = atr(candles); if (!a) return null;
+  const per = tfMinutes(tf);
+  const barsInRange = Math.max(1, Math.round(rangeMins / per));
+  const n = candles.length - 1, last = candles[n];
+  const asDate = (c) => new Date(typeof c.t === "string" ? Date.parse(c.t) : Number(c.t));
+  const dayNum = (d) => d.getUTCFullYear() * 1e4 + (d.getUTCMonth() + 1) * 100 + d.getUTCDate();
+  const today = dayNum(asDate(last));
+
+  for (const name of sessions) {
+    const openH = SESSIONS[name]?.openUTC; if (openH == null) continue;
+    const idx = [];
+    for (let i = Math.max(0, n - 60); i <= n; i++) {
+      const d = asDate(candles[i]);
+      if (dayNum(d) !== today) continue;
+      const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+      if (mins >= openH * 60 && mins < openH * 60 + rangeMins) idx.push(i);
+    }
+    if (idx.length < barsInRange) continue;
+
+    const rangeBars = idx.slice(0, barsInRange);
+    const rHigh = Math.max(...rangeBars.map(i => candles[i].h));
+    const rLow = Math.min(...rangeBars.map(i => candles[i].l));
+    if (rHigh - rLow < a * minRangeAtr) continue;
+
+    const lastRangeIdx = rangeBars[rangeBars.length - 1];
+    if (n <= lastRangeIdx) continue;
+
+    let dir = null, breakIdx = -1;
+    for (let i = lastRangeIdx + 1; i <= n; i++) {
+      if (candles[i].c > rHigh) { dir = "buy"; breakIdx = i; break; }
+      if (candles[i].c < rLow) { dir = "sell"; breakIdx = i; break; }
+    }
+    if (!dir || n - breakIdx > 2) continue;
+
+    const level = dir === "buy" ? rHigh : rLow;
+    if (Math.abs(last.c - level) > a * maxChaseAtr) continue;
+
+    const buf = a * 0.15, entry = last.c;
+    const sl = dir === "buy" ? rLow - buf : rHigh + buf;
+    if (dir === "buy" ? sl >= entry : sl <= entry) continue;
+    return { type: "orb", dir, entry, sl, atr: a, session: name,
+             rangeHigh: +rHigh.toFixed(6), rangeLow: +rLow.toFixed(6),
+             note: `${name} open: range ${rLow.toFixed(5)}-${rHigh.toFixed(5)}, close ${dir === "buy" ? "above" : "below"} it` };
+  }
+  return null;
+}
+
+// ---------- combine: HTF bias -> LTF entry ----------
+function findSetups({ htf, ltf, rr = 3, minRR = 2, strategies = ["trendline", "smc"], tf = "1H", orbOpts = {} }) {
+  const { bias } = structure(htf);
   const out = [];
-  for (const fn of [trendlineSetup, bosZoneSetup]) {
-    const s = fn(ltf, bias);
-    if (!s) continue;
+
+  // trend-following setups (need a daily bias)
+  if (bias !== "neutral" && (strategies.includes("trendline") || strategies.includes("smc"))) {
+    for (const fn of [trendlineSetup, bosZoneSetup]) {
+      if (fn === trendlineSetup && !strategies.includes("trendline")) continue;
+      if (fn === bosZoneSetup && !strategies.includes("smc")) continue;
+      const s = fn(ltf, bias);
+      if (s) out.push(s);
+    }
+  }
+
+  // ORB is trend-agnostic — a session breakout doesn't need the daily bias
+  if (strategies.includes("orb")) {
+    const s = orbSetup(ltf, tf, orbOpts);
+    if (s) out.push(s);
+  }
+
+  const setups = [];
+  for (const s of out) {
     const risk = Math.abs(s.entry - s.sl);
     if (!risk) continue;
     const tp = s.dir === "sell" ? s.entry - risk * rr : s.entry + risk * rr;
-    const stopPct = (risk / s.entry) * 100;
     if (rr < minRR) continue;
-    out.push({ ...s, tp, rr, risk, stopPct: +stopPct.toFixed(3), htfBias: bias });
+    setups.push({ ...s, tp, rr, risk, stopPct: +((risk / s.entry) * 100).toFixed(3), htfBias: bias });
   }
-  return { bias, setups: out };
+  return { bias, setups };
 }
 
 /* ------------------------------------------------------------
@@ -250,6 +322,6 @@ function chartBrief(htf, ltf) {
   };
 }
 
-module.exports = { swings, structure, atr, trendlineSetup, bosZoneSetup, findSetups,
+module.exports = { swings, structure, atr, trendlineSetup, bosZoneSetup, orbSetup, findSetups,
                    trendlineState, bosState, chartBrief };
 
