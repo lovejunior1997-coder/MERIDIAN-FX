@@ -18,7 +18,7 @@ const { findSetups } = require("./strategy");
 
 const T = (c) => (typeof c.t === "string" ? Date.parse(c.t) : Number(c.t));
 
-function backtest({ htf, ltf, rr = 3, warmup = 60, cooldownBars = 5, spread = 0, maxBars = 0 }) {
+function backtest({ htf, ltf, rr = 3, warmup = 60, cooldownBars = 5, spread = 0, maxBars = 0, strategies = ["trendline","smc"], tf = "1H" }) {
   const trades = [];
   let open = null, lastEntry = -1e9;
 
@@ -60,7 +60,7 @@ function backtest({ htf, ltf, rr = 3, warmup = 60, cooldownBars = 5, spread = 0,
     if (htfHist.length < 30) continue;
 
     let res;
-    try { res = findSetups({ htf: htfHist, ltf: hist, rr }); } catch (_) { continue; }
+    try { res = findSetups({ htf: htfHist, ltf: hist, rr, strategies, tf }); } catch (_) { continue; }
     if (!res.setups.length) continue;
 
     const s = res.setups[0];
@@ -108,7 +108,7 @@ function summarize(trades) {
 
 function byType(trades) {
   const out = {};
-  for (const t of ["trendline", "smc"]) {
+  for (const t of ["trendline", "smc", "orb"]) {
     const subset = trades.filter((x) => x.type === t);
     if (subset.length) out[t] = summarize(subset);
   }
